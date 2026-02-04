@@ -1,0 +1,1324 @@
+"""
+SupplierDiscoveryAgent implementation.
+
+Searches and evaluates suppliers based on intake requirements.
+Supports hybrid discovery from internal DB and web sources.
+"""
+
+import json
+import re
+import uuid
+import time
+from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import urlparse
+
+from semantic_kernel import Kernel
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
+from app.agents.base import BaseAgent
+from app.core.database import get_db_context
+from app.core.logging_config import get_logger
+from app.core.config import settings
+from app.models.database import AgentConversation, Project, ProjectSupplier, Supplier
+from app.services.bedrock_converse_service import BedrockConverseService
+from app.services.hybrid_supplier_search import get_hybrid_search_service
+
+logger = get_logger(__name__)
+
+
+class SupplierDiscoveryAgent(BaseAgent):
+    """
+    Supplier search and evaluation agent.
+
+    Uses vector similarity search and scoring algorithms
+    to find and rank potential suppliers based on intake requirements.
+    Supports hybrid discovery from internal DB and web sources.
+    """
+
+    name = "SupplierDiscoveryAgent"
+
+    def __init__(self, kernel: Kernel):
+        super().__init__(kernel)
+        self._intake_context: dict[str, Any] = {}
+        self._favorites_context: list[dict[str, Any]] = []
+        self._current_project_id: uuid.UUID | None = None
+
+        # Initialize Converse Service for Web Grounding
+        self.converse_service = BedrockConverseService(
+            model_id=getattr(settings, "SUPPLIER_DISCOVERY_MODEL_ID", None)
+        )
+
+        # Initialize Hybrid Search Service
+        self.hybrid_search_service = get_hybrid_search_service()
+
+    async def initialize(self) -> None:
+        """Initialize with specific service ID for Nova."""
+        await super().initialize()
+
+    @staticmethod
+    def is_url(value: str) -> bool:
+        """
+        Check if a string is a URL.
+
+        Detects URLs starting with http/https or common domain patterns.
+        """
+        value = value.strip()
+
+        # Check for explicit protocol
+        if value.startswith(("http://", "https://")):
+            return True
+
+        # Check for common domain patterns (e.g., "accenture.com", "www.ibm.com")
+        url_pattern = r'^(www\.)?[a-zA-Z0-9][-a-zA-Z0-9]*(\.[a-zA-Z]{2,})+(/.*)?$'
+        if re.match(url_pattern, value, re.IGNORECASE):
+            return True
+
+        return False
+
+    @staticmethod
+    def normalize_url(value: str) -> str:
+        """Normalize a URL by adding https:// if missing."""
+        value = value.strip()
+        if not value.startswith(("http://", "https://")):
+            value = f"https://{value}"
+        return value
+
+    # Domains that are not company websites
+    BLOCKED_DOMAINS = {
+        # Information/reference sites
+        "wikipedia.org", "wikimedia.org", "britannica.com", "investopedia.com",
+        # News sites
+        "reuters.com", "bloomberg.com", "forbes.com", "wsj.com", "nytimes.com",
+        "bbc.com", "cnn.com", "techcrunch.com", "theverge.com", "wired.com",
+        "businessinsider.com", "ft.com", "economist.com", "cnbc.com",
+        # Social media
+        "facebook.com", "twitter.com", "x.com", "instagram.com", "tiktok.com",
+        "youtube.com", "reddit.com", "pinterest.com", "tumblr.com",
+        # Search engines
+        "google.com", "bing.com", "yahoo.com", "duckduckgo.com", "baidu.com",
+        # General directories
+        "yelp.com", "yellowpages.com", "bbb.org", "manta.com", "thomasnet.com",
+        # Job sites
+        "indeed.com", "glassdoor.com", "monster.com", "ziprecruiter.com",
+        # E-commerce marketplaces (not suppliers themselves)
+        "amazon.com", "ebay.com", "alibaba.com", "aliexpress.com", "etsy.com",
+        # Government/generic
+        "gov", "edu", "mil",
+        # File sharing / tools
+        "github.com", "gitlab.com", "dropbox.com", "drive.google.com",
+    }
+
+    # Domains that need special handling (company pages within them are OK)
+    COMPANY_PAGE_DOMAINS = {"linkedin.com", "crunchbase.com", "dnb.com", "zoominfo.com"}
+
+    def _is_blocked_domain(self, url: str) -> tuple[bool, str]:
+        """Check if URL is from a blocked non-company domain."""
+        parsed = urlparse(self.normalize_url(url))
+        domain = parsed.netloc.lower().replace("www.", "")
+
+        # Check exact matches and subdomains
+        for blocked in self.BLOCKED_DOMAINS:
+            if domain == blocked or domain.endswith(f".{blocked}"):
+                return True, f"'{blocked}' is not a company website. Please enter the company's official website URL."
+
+        # LinkedIn/Crunchbase company pages are OK, but not the main site
+        for page_domain in self.COMPANY_PAGE_DOMAINS:
+            if domain == page_domain or domain.endswith(f".{page_domain}"):
+                if "/company/" not in url.lower() and "/organization/" not in url.lower():
+                    return True, f"Please provide a direct company page URL from {page_domain}, or the company's official website."
+
+        return False, ""
+
+    async def parse_supplier_from_url(
+        self,
+        url: str,
+        intake_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Parse supplier information from a company website URL using web grounding.
+
+        Args:
+            url: The company website URL to parse
+            intake_context: Project intake context for relevance validation
+
+        Returns:
+            Dictionary with extracted supplier information, or error details if invalid
+        """
+        normalized_url = self.normalize_url(url)
+
+        # Check if URL is from a blocked domain
+        is_blocked, block_reason = self._is_blocked_domain(url)
+        if is_blocked:
+            return {
+                "error": block_reason,
+                "is_valid_supplier": False,
+                "url": normalized_url,
+            }
+
+        # Extract domain for fallback name
+        parsed = urlparse(normalized_url)
+        domain = parsed.netloc.replace("www.", "")
+        fallback_name = domain.split(".")[0].title()
+
+        # Build context-aware prompt
+        context_info = ""
+        if intake_context:
+            category = intake_context.get("metadata", {}).get("category", "")
+            subcategory = intake_context.get("metadata", {}).get("subcategory", "")
+            region = intake_context.get("metadata", {}).get("region", "")
+            requirements = intake_context.get("narrative", "")[:300]
+
+            if category or subcategory:
+                context_info = f"""
+Project Requirements:
+- Category: {category or 'Not specified'}
+- Subcategory: {subcategory or 'Not specified'}
+- Region: {region or 'Global'}
+- Key Requirements: {requirements or 'General procurement'}
+
+Evaluate if this company can serve as a supplier for these requirements."""
+
+        extraction_prompt = f"""Analyze {normalized_url} and determine if it's a legitimate supplier company.
+{context_info}
+
+Return ONLY this JSON (no other text):
+{{"name":"company name","description":"1-2 sentence description","location":"HQ city, country","capabilities":["service1","service2"],"categories":["industry1"],"employee_count":"number","revenue":"amount","is_valid_supplier":true/false,"relevance_score":0-100,"relevance_reason":"why relevant or not"}}
+
+- is_valid_supplier: false if it's not a real company website (news site, directory, personal blog, etc.)
+- relevance_score: 0-100 based on how well the company matches the project requirements (100=perfect match)
+- relevance_reason: brief explanation of fit or why not suitable"""
+
+        try:
+            # Use the Converse service with web grounding to fetch and analyze the URL
+            result = await self.converse_service.converse(
+                messages=[{"role": "user", "content": [{"text": extraction_prompt}]}],
+                system="You extract company information and return ONLY valid JSON. No explanations, no examples, no markdown - just the JSON object with the company's actual data.",
+                enable_grounding=True,
+            )
+
+            response_text = result.get("text", "")
+
+            # Try to parse the JSON response
+            try:
+                # Clean up the response - extract JSON from potential surrounding text
+                json_text = response_text.strip()
+
+                # Remove markdown code blocks if present
+                if "```" in json_text:
+                    code_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', json_text)
+                    if code_match:
+                        json_text = code_match.group(1).strip()
+
+                # Find JSON object by locating first { and last }
+                first_brace = json_text.find('{')
+                last_brace = json_text.rfind('}')
+                if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                    json_text = json_text[first_brace:last_brace + 1]
+
+                supplier_data = json.loads(json_text)
+
+                # Validate we got actual company data, not example data
+                name = supplier_data.get("name", "")
+                if "example" in name.lower() or not name:
+                    raise ValueError("Received example data instead of real company info")
+
+                # Check if it's a valid supplier
+                is_valid = supplier_data.get("is_valid_supplier", True)
+                if is_valid is False or str(is_valid).lower() == "false":
+                    return {
+                        "error": supplier_data.get("relevance_reason", "This does not appear to be a valid supplier company website."),
+                        "is_valid_supplier": False,
+                        "url": normalized_url,
+                        "name": supplier_data.get("name") or fallback_name,
+                    }
+
+                # Check relevance score if intake context was provided
+                relevance_score = supplier_data.get("relevance_score", 100)
+                try:
+                    relevance_score = int(relevance_score)
+                except (ValueError, TypeError):
+                    relevance_score = 50
+
+                # Warn if low relevance but still allow adding
+                relevance_warning = None
+                if intake_context and relevance_score < 30:
+                    relevance_warning = supplier_data.get("relevance_reason", "This company may not be relevant to your project requirements.")
+
+                # Ensure all expected fields exist with defaults
+                return {
+                    "name": supplier_data.get("name") or fallback_name,
+                    "description": supplier_data.get("description") or f"Company website: {normalized_url}",
+                    "website": normalized_url,
+                    "location": supplier_data.get("location") or "",
+                    "capabilities": supplier_data.get("capabilities") or [],
+                    "categories": supplier_data.get("categories") or [],
+                    "employee_count": supplier_data.get("employee_count") or "",
+                    "revenue": supplier_data.get("revenue") or "",
+                    "parsed_from_url": True,
+                    "source_url": normalized_url,
+                    "is_valid_supplier": True,
+                    "relevance_score": relevance_score,
+                    "relevance_reason": supplier_data.get("relevance_reason", ""),
+                    "relevance_warning": relevance_warning,
+                }
+
+            except (json.JSONDecodeError, ValueError) as parse_err:
+                # If JSON parsing fails, return error - don't add unverified supplier
+                logger.warning(f"Failed to parse supplier from URL: {parse_err}. Response: {response_text[:200]}")
+
+                return {
+                    "error": "Could not extract company information from this URL. Please verify it's a company website.",
+                    "is_valid_supplier": False,
+                    "url": normalized_url,
+                    "name": fallback_name,
+                }
+
+        except Exception as e:
+            logger.error(f"Error parsing supplier from URL {url}: {e}", exc_info=True)
+
+            return {
+                "error": f"Failed to analyze URL: {str(e)}",
+                "is_valid_supplier": False,
+                "url": normalized_url,
+                "name": fallback_name,
+            }
+
+    async def chat(
+        self,
+        message: str,
+        conversation_id: str | None = None,
+        context: dict[str, Any] | None = None,
+        project_id: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
+        """
+        Overridden chat method to use Amazon Nova for real-time web grounding.
+        Supports intent detection for add/remove/refine supplier actions.
+        """
+        start_time = time.time()
+        conv_id = conversation_id or str(uuid.uuid4())
+        actions: list[dict[str, Any]] = []
+
+        # 1. Load context and history
+        if conv_id in self._chat_histories:
+            history = self._chat_histories[conv_id]
+        else:
+            history = await self.load_history_from_db(conv_id)
+
+        # 2. Project Context Loading
+        if context is None:
+            context = {}
+
+        # Try to resolve project_id if missing but available in context
+        if project_id is None and context.get("project_id"):
+            try:
+                project_id = uuid.UUID(context["project_id"])
+            except (ValueError, TypeError):
+                pass
+
+        # Store project_id for later use
+        self._current_project_id = project_id
+
+        # If we have a project_id, load the intake context
+        if project_id:
+            try:
+                await self.load_intake_context_from_project(project_id)
+            except Exception as e:
+                logger.warning(f"Failed to load project context: {e}")
+
+        # 3. Detect intent for supplier actions
+        intent = self._detect_intent(message)
+        if intent and project_id:
+            intent_result = await self._handle_intent(intent, message, project_id)
+            if intent_result.get("actions"):
+                actions.extend(intent_result["actions"])
+
+        # 3b. If no specific intent but message seems supplier-related, auto-discover
+        # This ensures proactive discovery for any supplier-related query
+        if not intent and project_id and self._is_supplier_related_query(message):
+            logger.info(f"Auto-triggering discovery for supplier-related query: {message[:50]}...")
+            try:
+                discovery_result = await self.discover_suppliers(project_id, trigger="chat_auto")
+                if discovery_result.get("created_records"):
+                    for record in discovery_result["created_records"]:
+                        actions.append({
+                            "type": "supplier_discovered",
+                            "supplier": record,
+                        })
+            except Exception as e:
+                logger.warning(f"Auto-discovery failed: {e}")
+
+        # 4. Prepare message for the LLM call
+        # We DON'T use _prepare_message here because it prepends system instructions
+        # which we want to pass separately to the Converse API's 'system' parameter.
+        history.add_user_message(message)
+
+        try:
+            # Format history for Bedrock Converse API
+            converse_messages = []
+            for msg in history.messages:
+                # Map SK Role to Bedrock Role
+                role = "user" if msg.role.value == "user" else "assistant"
+                content = str(msg.content)
+                if not content:
+                    continue
+
+                converse_messages.append({
+                    "role": role,
+                    "content": [{"text": content}]
+                })
+
+            # Ensure conversation starts with a user message (Bedrock requirement)
+            while converse_messages and converse_messages[0]["role"] != "user":
+                converse_messages.pop(0)
+
+            if not converse_messages:
+                # Fallback if history somehow empty
+                converse_messages = [{"role": "user", "content": [{"text": message}]}]
+
+            # 5. Invoke LLM with Grounding
+            result = await self.converse_service.converse(
+                messages=converse_messages,
+                system=self.instructions,
+                enable_grounding=True
+            )
+
+            response_text = result.get("text", "")
+            citations = result.get("citations", [])
+
+            # 6. Save response and update history
+            if response_text:
+                history.add_assistant_message(response_text)
+            else:
+                response_text = "I'm sorry, I couldn't generate a response. Please try again."
+
+            duration_ms = int((time.time() - start_time) * 1000)
+
+            # Telemetry
+            try:
+                await self.conversation_manager.record_telemetry(
+                    agent_name=self.name,
+                    operation="chat_hybrid",
+                    duration_ms=duration_ms,
+                    status="success",
+                    metadata={
+                        "conversation_id": conv_id,
+                        "grounded": len(citations) > 0,
+                        "project_id": str(project_id) if project_id else None,
+                        "actions_count": len(actions),
+                    },
+                )
+            except Exception:
+                pass
+
+            await self.save_conversation(conv_id, project_id=project_id)
+
+            # 7. Get updated project suppliers if project_id is available
+            project_suppliers = []
+            if project_id:
+                project_suppliers = await self._get_project_suppliers(project_id)
+
+            return {
+                "response": response_text,
+                "conversation_id": conv_id,
+                "agent": self.name,
+                "duration_ms": duration_ms,
+                "citations": citations,
+                "actions": actions,
+                "project_suppliers": project_suppliers,
+            }
+
+        except Exception as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            logger.error(f"Hybrid Agent {self.name} error: {e}", exc_info=True)
+            # Ensure we return SOMETHING even on error
+            return {
+                "response": f"I encountered an error while processing your request: {str(e)}",
+                "conversation_id": conv_id,
+                "agent": self.name,
+                "duration_ms": duration_ms,
+                "error": True,
+                "actions": actions,
+            }
+
+    def _is_supplier_related_query(self, message: str) -> bool:
+        """
+        Check if message is related to supplier discovery/recommendations.
+        Used for auto-triggering discovery when no specific intent is detected.
+        """
+        message_lower = message.lower()
+
+        # Keywords that indicate supplier-related queries
+        supplier_keywords = [
+            "supplier", "vendor", "provider", "company", "companies",
+            "recommend", "suggestion", "option", "alternative",
+            "who can", "who could", "which", "what are",
+            "help me find", "looking for", "need", "want",
+            "best", "top", "leading", "major",
+            "match", "fit", "suitable", "good for",
+        ]
+
+        # Check if message contains supplier-related keywords
+        keyword_count = sum(1 for kw in supplier_keywords if kw in message_lower)
+
+        # Trigger if 2+ keywords found or specific patterns
+        if keyword_count >= 2:
+            return True
+
+        # Also check for question patterns about suppliers
+        question_patterns = [
+            "can you find", "can you recommend", "can you suggest",
+            "show me", "give me", "list", "what supplier",
+            "any supplier", "some supplier",
+        ]
+        return any(pattern in message_lower for pattern in question_patterns)
+
+    def _detect_intent(self, message: str) -> dict[str, Any] | None:
+        """
+        Detect supplier action intent from user message.
+
+        Returns:
+            Intent dict with type and extracted data, or None if no intent detected
+        """
+        message_lower = message.lower()
+
+        # Detect "add supplier" intent
+        add_patterns = [
+            r"add\s+(?:supplier\s+)?([A-Z][a-zA-Z\s&]+?)(?:\s+to|$|\.|,)",
+            r"include\s+([A-Z][a-zA-Z\s&]+?)(?:\s+in|$|\.|,)",
+            r"consider\s+([A-Z][a-zA-Z\s&]+?)(?:\s+as|$|\.|,)",
+        ]
+        for pattern in add_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                return {"type": "add_supplier", "supplier_name": match.group(1).strip()}
+
+        # Detect "remove supplier" intent
+        remove_patterns = [
+            r"remove\s+(?:supplier\s+)?([A-Z][a-zA-Z\s&]+?)(?:\s+from|$|\.|,)",
+            r"delete\s+([A-Z][a-zA-Z\s&]+?)(?:\s+from|$|\.|,)",
+            r"drop\s+([A-Z][a-zA-Z\s&]+?)(?:\s+from|$|\.|,)",
+            r"exclude\s+([A-Z][a-zA-Z\s&]+?)(?:\s+from|$|\.|,)",
+        ]
+        for pattern in remove_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                return {"type": "remove_supplier", "supplier_name": match.group(1).strip()}
+
+        # Detect "discover suppliers" intent - check this BEFORE refine_search
+        # to prioritize supplier discovery for natural language requests
+        discover_phrases = [
+            # Explicit discovery requests
+            "discover suppliers", "find suppliers", "search suppliers",
+            "get recommendations", "suggest suppliers", "run discovery",
+            "discover some suppliers", "find some suppliers",
+            # Natural language patterns
+            "i need suppliers", "need suppliers for", "looking for suppliers",
+            "help me find suppliers", "recommend suppliers", "show me suppliers",
+            "what suppliers", "which suppliers", "suppliers for",
+            "find vendors", "looking for vendors", "need vendors",
+            "recommend vendors", "suggest vendors",
+            # Category-based requests
+            "find companies that", "find companies for", "search for companies",
+            "who can provide", "who provides", "who offers",
+            # Action-oriented
+            "start discovery", "begin discovery", "initiate discovery",
+            "match suppliers", "get supplier matches", "supplier matching",
+        ]
+        if any(phrase in message_lower for phrase in discover_phrases):
+            return {"type": "discover", "query": message}
+
+        # Detect "refine search" intent (more specific refinement after initial discovery)
+        refine_phrases = [
+            "find more in", "search for more in", "look for more",
+            "find additional", "more suppliers in", "explore more",
+            "narrow down", "filter by", "focus on",
+            "suppliers in europe", "suppliers in asia", "suppliers in america",
+        ]
+        if any(phrase in message_lower for phrase in refine_phrases):
+            return {"type": "refine_search", "query": message}
+
+        return None
+
+    async def _handle_intent(
+        self,
+        intent: dict[str, Any],
+        message: str,
+        project_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """
+        Handle detected supplier action intent.
+
+        Returns:
+            Result with any actions taken
+        """
+        actions = []
+        intent_type = intent.get("type")
+
+        if intent_type == "add_supplier":
+            supplier_name = intent.get("supplier_name", "")
+            result = await self.add_supplier_from_chat(project_id, {"name": supplier_name})
+            if result.get("id"):
+                actions.append({
+                    "type": "supplier_added",
+                    "supplier": result,
+                })
+
+        elif intent_type == "remove_supplier":
+            supplier_name = intent.get("supplier_name", "")
+            result = await self.remove_supplier_from_chat(project_id, supplier_name)
+            if result.get("deleted"):
+                actions.append({
+                    "type": "supplier_removed",
+                    "supplier": result,
+                })
+
+        elif intent_type == "refine_search":
+            query = intent.get("query", "")
+            result = await self.refine_search(project_id, query)
+            if result.get("new_suppliers"):
+                for supplier in result["new_suppliers"]:
+                    actions.append({
+                        "type": "supplier_added",
+                        "supplier": supplier,
+                    })
+
+        elif intent_type == "discover":
+            result = await self.discover_suppliers(project_id, trigger="chat")
+            if result.get("created_records"):
+                for record in result["created_records"]:
+                    actions.append({
+                        "type": "supplier_added",
+                        "supplier": record,
+                    })
+
+        return {"actions": actions}
+
+    def set_favorites_context(self, favorites: list[dict[str, Any]]) -> None:
+        """Set the favorite suppliers context for tailored recommendations."""
+        self._favorites_context = favorites or []
+
+    @property
+    def instructions(self) -> str:
+        intake_info = ""
+        if self._intake_context:
+            metadata = self._intake_context.get('metadata', {})
+            narrative = self._intake_context.get('narrative', '')
+            intake_info = f"""
+
+INTAKE SUMMARY CONTEXT (CRITICAL - USE THIS FOR ALL RECOMMENDATIONS):
+Category: {metadata.get('category', 'N/A')}
+Subcategory: {metadata.get('subcategory', 'N/A')}
+Region: {metadata.get('region', 'N/A')}
+Estimated Spend: {metadata.get('estimated_spend', 'N/A')}
+Timeline: {metadata.get('timeline', 'N/A')}
+Key KPI: {metadata.get('key_kpi', 'N/A')}
+RFx Type: {metadata.get('rfx_type', 'N/A')}
+Contract Term: {metadata.get('contract_term', 'N/A')}
+Number of Sites: {metadata.get('number_of_sites', 'N/A')}
+Key Requirements: {narrative[:500] if narrative else 'See conversation for details'}
+"""
+
+        # Add favorites context if available
+        favorites_info = ""
+        if self._favorites_context:
+            fav_names = [f.get('name', 'Unknown') for f in self._favorites_context]
+            fav_categories = list(set(cat for f in self._favorites_context for cat in (f.get('categories') or [])))
+            favorites_info = f"""
+
+FAVORITE SUPPLIERS CONTEXT:
+The user has marked these suppliers as favorites: {', '.join(fav_names)}
+Categories from favorites: {', '.join(fav_categories) if fav_categories else 'Various'}
+
+When making recommendations:
+1. Prioritize suppliers similar to the user's favorites (similar capabilities, categories, size)
+2. Highlight if a recommended supplier matches patterns from their favorites
+3. Explain why certain suppliers align with their preferences
+4. Suggest new suppliers that the user might like based on favorite characteristics
+5. If recommending a favorite supplier, mark it clearly with [FAVORITE]
+"""
+
+        return f"""You are the Supplier Discovery Agent for the Source-to-Pay platform.
+
+ Your responsibilities:
+1. Analyze intake requirements and suggest matching suppliers from our internal database
+2. Use real-time web grounding to gather market trends, industry news, and find official source URLs for the companies mentioned
+3. While the selection of suppliers is guided by internal context, you MUST use web grounding to find and include live source URLs for the suppliers and market data you provide
+4. Evaluate suppliers against specific requirements from the intake phase
+5. Score suppliers using multi-criteria evaluation (capabilities, pricing, location, compliance)
+6. Provide supplier recommendations with detailed justification
+7. Help users refine supplier criteria through conversation
+8. Provide tailored recommendations based on user's favorite suppliers
+9. Answer generic questions with real-time web information when requested (e.g., market indices, news, general facts)
+
+{intake_info}
+{favorites_info}
+
+IMPORTANT RULES:
+- ALWAYS reference the intake requirements when providing PROCUREMENT recommendations.
+- YOU MUST USE web grounding to search for official links and latest industry news for the recommended suppliers.
+- Every response that includes real-time facts or company details should include clickable source URLs (Citations).
+- If asked a totally generic question (unrelated to procurement), use web grounding to answer accurately with real-time info.
+- When the user asks for supplier recommendations, you MUST:
+  1. Use the intake metadata to match suppliers
+  2. Generate specific supplier recommendations
+  3. Reference the specific requirements from the intake phase
+
+When suggesting suppliers:
+1. Consider the category, subcategory, and region from intake
+2. Match supplier capabilities to the estimated spend and requirements
+3. Score suppliers on multiple criteria:
+   - **Capabilities**: Does the supplier have expertise in this category?
+   - **Geographic Coverage**: Can they serve the required regions?
+   - **Financial Stability**: Can they handle the contract value?
+   - **Compliance**: Do they meet required certifications?
+   - **Past Performance**: Track record and references
+   - **Pricing Competitiveness**: Market positioning
+4. Recommend 5-10 suppliers ranked by fit (A/B/C tiers)
+5. Explain why each supplier is recommended
+6. Flag any risks or considerations
+
+Supplier Recommendation Format:
+For each supplier, provide:
+- Name and brief description
+- Tier (A: Best fit, B: Good fit, C: Potential fit)
+- Score (0-100)
+- Strengths (3-4 key points)
+- Considerations (any concerns or gaps)
+- Geographic presence
+- Estimated pricing competitiveness
+
+Be conversational and helpful. Always reference the intake requirements when providing recommendations."""
+
+    @property
+    def description(self) -> str:
+        return "Searches and evaluates suppliers based on intake requirements using intelligent matching"
+
+    async def load_intake_context(self, intake_conversation_id: str) -> bool:
+        """Load intake summary as context for supplier discovery."""
+        try:
+            from uuid import UUID
+
+            # Try to parse as UUID first
+            try:
+                conv_uuid = UUID(intake_conversation_id)
+            except ValueError:
+                conv_uuid = None
+
+            # Try to get intake summary from database
+            async with get_db_context() as session:
+                if conv_uuid:
+                    # Query by UUID id
+                    result = await session.execute(
+                        select(AgentConversation).where(
+                            AgentConversation.id == conv_uuid
+                        )
+                    )
+                else:
+                    # Cannot query without valid UUID
+                    logger.warning(f"Invalid conversation_id format: {intake_conversation_id}")
+                    return False
+
+                conversation = result.scalar_one_or_none()
+
+                if conversation and conversation.context:
+                    summary = conversation.context.get("intake_summary")
+                    if summary and summary.get("has_data"):
+                        self._intake_context = summary
+                        logger.info(f"Loaded intake context from database: {intake_conversation_id}")
+                        return True
+
+            # Try loading from S3
+            try:
+                from app.services.s3_storage_service import get_s3_storage_service
+
+                s3_service = get_s3_storage_service()
+                s3_key = f"summaries/{intake_conversation_id}/intake_summary.json"
+
+                file_content = s3_service.download_file(s3_key)
+                summary_data = json.loads(file_content.decode('utf-8'))
+
+                if summary_data.get("has_data"):
+                    self._intake_context = summary_data
+                    logger.info(f"Loaded intake context from S3: {intake_conversation_id}")
+                    return True
+            except Exception as s3_error:
+                logger.debug(f"Could not load from S3: {s3_error}")
+
+            logger.warning(f"Intake summary not found for: {intake_conversation_id}")
+            return False
+
+        except Exception as e:
+            logger.error(f"Error loading intake context: {e}", exc_info=True)
+            return False
+
+    async def load_intake_context_from_project(self, project_id: uuid.UUID) -> bool:
+        """
+        Load intake context directly from the Project model and its intake conversation.
+
+        This method:
+        1. Loads project metadata (general_information, project_objectives, metadata_)
+        2. Finds the intake conversation for the project and loads intake_summary
+        3. Populates _intake_context for use in instructions
+
+        Args:
+            project_id: The project UUID to load intake from
+
+        Returns:
+            True if intake context was loaded successfully
+        """
+        try:
+            async with get_db_context() as session:
+                # Step 1: Load project data directly
+                project_result = await session.execute(
+                    select(Project).where(Project.id == project_id)
+                )
+                project = project_result.scalar_one_or_none()
+
+                if not project:
+                    logger.warning(f"Project not found: {project_id}")
+                    return False
+
+                # Build intake context from project data
+                intake_context: dict[str, Any] = {
+                    "has_data": False,
+                    "metadata": {},
+                    "narrative": "",
+                    "general_information": "",
+                    "project_objectives": [],
+                }
+
+                # Load from project fields
+                if project.general_information:
+                    intake_context["general_information"] = project.general_information
+                    intake_context["narrative"] = project.general_information
+                    intake_context["has_data"] = True
+
+                if project.project_objectives:
+                    intake_context["project_objectives"] = project.project_objectives
+                    intake_context["has_data"] = True
+
+                if project.metadata_:
+                    intake_context["metadata"] = project.metadata_
+                    intake_context["has_data"] = True
+
+                # Step 2: Try to load intake_summary from intake conversation
+                intake_conv_result = await session.execute(
+                    select(AgentConversation).where(
+                        AgentConversation.project_id == project_id,
+                        AgentConversation.agent_type == "intake"
+                    )
+                )
+                intake_conversation = intake_conv_result.scalar_one_or_none()
+
+                if intake_conversation and intake_conversation.context:
+                    intake_summary = intake_conversation.context.get("intake_summary", {})
+
+                    if intake_summary.get("has_data"):
+                        # Merge intake_summary data (it may have more detail)
+                        if intake_summary.get("metadata"):
+                            intake_context["metadata"].update(intake_summary["metadata"])
+                        if intake_summary.get("narrative") and not intake_context["narrative"]:
+                            intake_context["narrative"] = intake_summary["narrative"]
+                        if intake_summary.get("general_information") and not intake_context["general_information"]:
+                            intake_context["general_information"] = intake_summary["general_information"]
+                        if intake_summary.get("project_objectives") and not intake_context["project_objectives"]:
+                            intake_context["project_objectives"] = intake_summary["project_objectives"]
+                        intake_context["has_data"] = True
+
+                        logger.info(
+                            "Loaded intake context from intake conversation",
+                            extra={
+                                "project_id": str(project_id),
+                                "conversation_id": str(intake_conversation.id),
+                            }
+                        )
+
+                # Set the context if we have data
+                if intake_context["has_data"]:
+                    self._intake_context = intake_context
+                    logger.info(
+                        "Intake context loaded successfully",
+                        extra={
+                            "project_id": str(project_id),
+                            "has_metadata": bool(intake_context["metadata"]),
+                            "has_narrative": bool(intake_context["narrative"]),
+                            "has_objectives": bool(intake_context["project_objectives"]),
+                            "metadata_keys": list(intake_context["metadata"].keys()) if intake_context["metadata"] else [],
+                        }
+                    )
+                    return True
+                else:
+                    logger.warning(
+                        "No intake data found for project",
+                        extra={"project_id": str(project_id)}
+                    )
+                    return False
+
+        except Exception as e:
+            logger.error(f"Error loading intake context from project: {e}", exc_info=True)
+            return False
+
+
+    async def generate_supplier_recommendations(
+        self,
+        intake_conversation_id: str,
+        conversation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate supplier recommendations based on intake context."""
+        conv_id = conversation_id or str(uuid.uuid4())
+
+        # Load intake context
+        if not self._intake_context:
+            loaded = await self.load_intake_context(intake_conversation_id)
+            if not loaded:
+                return {
+                    "response": "⚠️ Unable to load intake context. Please complete the intake stage first.",
+                    "conversation_id": conv_id,
+                    "agent": self.name,
+                    "suppliers": [],
+                    "error": "intake_context_not_found"
+                }
+
+        # Generate suppliers based on intake (Internal Logic)
+        metadata = self._intake_context.get('metadata', {})
+        category = metadata.get('category', 'Professional Services')
+        region = metadata.get('region', 'North America')
+
+        # Use internal/sample generation as requested (no web search for the formal recommendation list)
+        suppliers = self._generate_sample_suppliers(category, region)
+
+        response_text = f"""Based on your intake requirements, I've identified {len(suppliers)} potential suppliers from our internal database:
+
+**Intake Requirements:**
+- Category: {category}
+- Region: {region}
+- Estimated Spend: {metadata.get('estimated_spend', 'N/A')}
+
+The suppliers are ranked by fit:
+- **Tier A**: Best fit for your requirements
+- **Tier B**: Good fit with some considerations
+- **Tier C**: Potential fit with more validation needed
+
+Would you like me to provide more details about any specific supplier or perform a live market search for more information?"""
+
+        # Save to context
+        discovery_data = {
+            "conversation_id": conv_id,
+            "intake_conversation_id": intake_conversation_id,
+            "suppliers": suppliers,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        await self.update_context(conv_id, {"supplier_discovery": discovery_data})
+
+        return {
+            "response": response_text,
+            "conversation_id": conv_id,
+            "agent": self.name,
+            "suppliers": suppliers,
+            "intake_conversation_id": intake_conversation_id,
+        }
+
+
+    def _generate_sample_suppliers(
+        self,
+        category: str,
+        region: str,
+    ) -> list[dict[str, Any]]:
+        """Generate sample supplier recommendations based on category."""
+        supplier_db = {
+            "IT Services": [
+                {"name": "Accenture", "score": 95, "tier": "A"},
+                {"name": "IBM Global Services", "score": 93, "tier": "A"},
+                {"name": "Cognizant", "score": 90, "tier": "A"},
+                {"name": "Infosys", "score": 87, "tier": "B"},
+                {"name": "Wipro", "score": 85, "tier": "B"},
+                {"name": "TCS", "score": 82, "tier": "B"},
+            ],
+            "Professional Services": [
+                {"name": "Deloitte Consulting", "score": 96, "tier": "A"},
+                {"name": "McKinsey & Company", "score": 94, "tier": "A"},
+                {"name": "Boston Consulting Group", "score": 92, "tier": "A"},
+                {"name": "PwC Advisory", "score": 88, "tier": "B"},
+                {"name": "EY Consulting", "score": 86, "tier": "B"},
+                {"name": "KPMG Advisory", "score": 83, "tier": "B"},
+            ],
+        }
+
+        matching_suppliers = supplier_db.get(category, supplier_db["Professional Services"])
+
+        suppliers = []
+        for supplier in matching_suppliers[:8]:
+            suppliers.append({
+                "id": str(uuid.uuid4()),
+                "name": supplier["name"],
+                "tier": supplier["tier"],
+                "score": supplier["score"],
+                "category": category,
+                "description": f"Leading provider of {category.lower()} with global capabilities",
+                "strengths": [
+                    f"Expertise in {category}",
+                    f"Strong presence in {region}",
+                    "Proven track record",
+                ],
+                "considerations": ["Requires detailed proposal evaluation"],
+                "geographic_coverage": region,
+                "selected": False,
+            })
+
+        return suppliers
+
+    # =========================================================================
+    # Hybrid Discovery Methods
+    # =========================================================================
+
+    async def discover_suppliers(
+        self,
+        project_id: uuid.UUID,
+        trigger: str = "manual",
+    ) -> dict[str, Any]:
+        """
+        Trigger hybrid supplier discovery for a project.
+
+        Args:
+            project_id: Project to discover suppliers for
+            trigger: What triggered the discovery ("manual", "auto", "chat")
+
+        Returns:
+            Discovery results with created ProjectSupplier records
+        """
+        try:
+            result = await self.hybrid_search_service.hybrid_search(
+                project_id=project_id,
+                auto_save=True,
+            )
+
+            logger.info(
+                "Supplier discovery completed",
+                extra={
+                    "project_id": str(project_id),
+                    "trigger": trigger,
+                    "internal_count": len(result.get("internal_suppliers", [])),
+                    "web_count": len(result.get("web_suppliers", [])),
+                }
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Supplier discovery error: {e}", exc_info=True)
+            return {"error": str(e)}
+
+    async def add_supplier_from_chat(
+        self,
+        project_id: uuid.UUID,
+        supplier_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Add a supplier to a project via chat command.
+
+        Args:
+            project_id: Project to add supplier to
+            supplier_data: Supplier data (name required, other fields optional)
+
+        Returns:
+            Created ProjectSupplier record info
+        """
+        try:
+            supplier_name = supplier_data.get("name", "").strip()
+            if not supplier_name:
+                return {"error": "Supplier name is required"}
+
+            # First, try to find matching supplier in internal database
+            internal_suppliers = await self.hybrid_search_service.search_internal(
+                query=supplier_name,
+                limit=5,
+                threshold=0.6,
+            )
+
+            # Check for exact or close name match
+            matched_internal = None
+            for supplier in internal_suppliers:
+                if supplier["name"].lower() == supplier_name.lower():
+                    matched_internal = supplier
+                    break
+                # Fuzzy match - name contains or is contained
+                if (supplier_name.lower() in supplier["name"].lower() or
+                    supplier["name"].lower() in supplier_name.lower()):
+                    matched_internal = supplier
+                    break
+
+            if matched_internal:
+                # Add internal supplier
+                result = await self.hybrid_search_service.add_supplier_to_project(
+                    project_id=project_id,
+                    supplier_data={"supplier_id": matched_internal["id"]},
+                    source="chat",
+                )
+                result["matched_internal"] = True
+            else:
+                # Add as external/web supplier
+                result = await self.hybrid_search_service.add_supplier_to_project(
+                    project_id=project_id,
+                    supplier_data=supplier_data,
+                    source="chat",
+                )
+                result["matched_internal"] = False
+
+            logger.info(
+                "Supplier added via chat",
+                extra={
+                    "project_id": str(project_id),
+                    "supplier_name": supplier_name,
+                    "matched_internal": result.get("matched_internal"),
+                }
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error adding supplier from chat: {e}", exc_info=True)
+            return {"error": str(e)}
+
+    async def remove_supplier_from_chat(
+        self,
+        project_id: uuid.UUID,
+        supplier_name: str,
+    ) -> dict[str, Any]:
+        """
+        Remove a supplier from a project via chat command.
+
+        Args:
+            project_id: Project to remove supplier from
+            supplier_name: Name of supplier to remove
+
+        Returns:
+            Result of removal
+        """
+        try:
+            supplier_name = supplier_name.strip()
+            if not supplier_name:
+                return {"error": "Supplier name is required", "deleted": False}
+
+            # Find the ProjectSupplier record by name
+            async with get_db_context() as session:
+                # Get all project suppliers for this project
+                result = await session.execute(
+                    select(ProjectSupplier)
+                    .options(selectinload(ProjectSupplier.supplier))
+                    .where(ProjectSupplier.project_id == project_id)
+                )
+                project_suppliers = result.scalars().all()
+
+                # Find matching supplier by name
+                matched_record = None
+                for ps in project_suppliers:
+                    ps_name = ps.supplier_name.lower()
+                    if (ps_name == supplier_name.lower() or
+                        supplier_name.lower() in ps_name or
+                        ps_name in supplier_name.lower()):
+                        matched_record = ps
+                        break
+
+                if not matched_record:
+                    return {
+                        "error": f"Supplier '{supplier_name}' not found in project",
+                        "deleted": False,
+                    }
+
+                # Remove the record
+                delete_result = await self.hybrid_search_service.remove_supplier_from_project(
+                    matched_record.id
+                )
+
+                logger.info(
+                    "Supplier removed via chat",
+                    extra={
+                        "project_id": str(project_id),
+                        "supplier_name": supplier_name,
+                    }
+                )
+
+                return delete_result
+
+        except Exception as e:
+            logger.error(f"Error removing supplier from chat: {e}", exc_info=True)
+            return {"error": str(e), "deleted": False}
+
+    async def refine_search(
+        self,
+        project_id: uuid.UUID,
+        query: str,
+    ) -> dict[str, Any]:
+        """
+        Refine supplier search based on user query.
+
+        Args:
+            project_id: Project to search for
+            query: Refined search query
+
+        Returns:
+            New suppliers found and added
+        """
+        try:
+            # Extract any region/category hints from query
+            category = None
+            region = None
+
+            # Simple region detection
+            region_patterns = {
+                "europe": "Europe",
+                "asia": "Asia Pacific",
+                "apac": "Asia Pacific",
+                "north america": "North America",
+                "latam": "Latin America",
+                "emea": "EMEA",
+            }
+            query_lower = query.lower()
+            for pattern, region_name in region_patterns.items():
+                if pattern in query_lower:
+                    region = region_name
+                    break
+
+            # Run web search with the refined query
+            web_results = await self.hybrid_search_service.search_web(
+                query=query,
+                category=category,
+                region=region,
+                limit=5,
+            )
+
+            # Save new suppliers
+            new_suppliers = []
+            async with get_db_context() as session:
+                for supplier in web_results:
+                    try:
+                        record = ProjectSupplier(
+                            project_id=project_id,
+                            supplier_id=None,
+                            status="suggested",
+                            source="web_discovery",
+                            external_supplier_data={
+                                "name": supplier["name"],
+                                "description": supplier.get("description", ""),
+                                "website": supplier.get("website", ""),
+                                "location": supplier.get("location", ""),
+                                "capabilities": supplier.get("capabilities", []),
+                            },
+                            discovery_context={
+                                "search_query": query,
+                                "match_reason": "Refined search via chat",
+                            },
+                            metadata_={
+                                "tier": "B",
+                                "discovered_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                        session.add(record)
+                        await session.flush()
+                        new_suppliers.append({
+                            "id": str(record.id),
+                            "name": supplier["name"],
+                            "source": "web_discovery",
+                        })
+                    except Exception as e:
+                        logger.warning(f"Failed to save refined search supplier: {e}")
+
+                await session.commit()
+
+            logger.info(
+                "Refined search completed",
+                extra={
+                    "project_id": str(project_id),
+                    "query": query[:50],
+                    "new_suppliers_count": len(new_suppliers),
+                }
+            )
+
+            return {
+                "query": query,
+                "new_suppliers": new_suppliers,
+                "total_found": len(web_results),
+            }
+
+        except Exception as e:
+            logger.error(f"Refine search error: {e}", exc_info=True)
+            return {"error": str(e), "new_suppliers": []}
+
+    async def _get_project_suppliers(
+        self,
+        project_id: uuid.UUID,
+    ) -> list[dict[str, Any]]:
+        """
+        Get all ProjectSupplier records for a project.
+
+        Args:
+            project_id: Project ID
+
+        Returns:
+            List of project supplier data
+        """
+        try:
+            async with get_db_context() as session:
+                result = await session.execute(
+                    select(ProjectSupplier)
+                    .options(selectinload(ProjectSupplier.supplier))
+                    .where(ProjectSupplier.project_id == project_id)
+                    .order_by(ProjectSupplier.created_at.desc())
+                )
+                records = result.scalars().all()
+
+                suppliers = []
+                for ps in records:
+                    supplier_data = {
+                        "id": str(ps.id),
+                        "project_id": str(ps.project_id),
+                        "supplier_id": str(ps.supplier_id) if ps.supplier_id else None,
+                        "name": ps.supplier_name,
+                        "status": ps.status,
+                        "match_score": float(ps.match_score) if ps.match_score else None,
+                        "source": ps.source,
+                        "is_web_discovered": ps.is_web_discovered,
+                        "created_at": ps.created_at.isoformat() if ps.created_at else None,
+                    }
+
+                    # Add internal supplier details if available
+                    if ps.supplier:
+                        supplier_data["description"] = ps.supplier.description
+                        supplier_data["categories"] = ps.supplier.categories or []
+                        supplier_data["capabilities"] = ps.supplier.capabilities or {}
+                        supplier_data["contact_info"] = ps.supplier.contact_info or {}
+                        supplier_data["performance_score"] = (
+                            float(ps.supplier.performance_score)
+                            if ps.supplier.performance_score else None
+                        )
+
+                    # Add external supplier details if available
+                    elif ps.external_supplier_data:
+                        ext = ps.external_supplier_data
+                        supplier_data["description"] = ext.get("description", "")
+                        supplier_data["categories"] = ext.get("capabilities", [])
+                        supplier_data["capabilities"] = {"services": ext.get("capabilities", [])}
+                        supplier_data["contact_info"] = {
+                            "website": ext.get("website", ""),
+                            "location": ext.get("location", ""),
+                        }
+                        supplier_data["source_urls"] = ext.get("source_urls", [])
+
+                    # Add discovery context if available
+                    if ps.discovery_context:
+                        supplier_data["match_reason"] = ps.discovery_context.get("match_reason")
+
+                    # Add metadata
+                    if ps.metadata_:
+                        supplier_data["tier"] = ps.metadata_.get("tier")
+
+                    suppliers.append(supplier_data)
+
+                return suppliers
+
+        except Exception as e:
+            logger.error(f"Error getting project suppliers: {e}", exc_info=True)
+            return []
